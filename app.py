@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import os
 from pathlib import Path
 
 import joblib
@@ -27,6 +28,34 @@ HERE = Path(__file__).resolve().parent
 REAL_PATH = HERE / "real_data.csv"
 MODEL_PATH = HERE / "model.joblib"
 
+# โหมดออนไลน์ (Streamlit Community Cloud หรือตั้ง DD_CLOUD=1):
+# ข้อมูลจริงของผู้ใช้แต่ละคนเก็บแยกในเซสชันของตัวเอง ไม่ปนกัน และไม่บันทึกลงเซิร์ฟเวอร์
+CLOUD = os.environ.get("DD_CLOUD") == "1" or HERE.as_posix().startswith("/mount/src")
+
+
+def get_real() -> pd.DataFrame:
+    if CLOUD:
+        if "real_df" not in st.session_state:
+            st.session_state["real_df"] = pd.DataFrame(columns=core.REAL_COLUMNS)
+        return st.session_state["real_df"].copy()
+    return core.load_real(REAL_PATH)
+
+
+def put_real(df: pd.DataFrame) -> None:
+    if CLOUD:
+        st.session_state["real_df"] = df[core.REAL_COLUMNS].reset_index(drop=True)
+    else:
+        core.save_real(df, REAL_PATH)
+
+
+@st.cache_resource(show_spinner=False)
+def default_bundle() -> dict:
+    """โมเดลเริ่มต้น (ข้อมูลจำลองอย่างเดียว) ใช้ร่วมกันทุกผู้ใช้ เทรนครั้งเดียวต่อเซิร์ฟเวอร์"""
+    b = core.train(core.generate_synthetic(3000, 0), pd.DataFrame(columns=core.REAL_COLUMNS), mode="mix", kind="mlp")
+    b["trained_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
+    b["n_synth"] = 3000
+    return b
+
 st.set_page_config(page_title="ทำนายค่าสปริงแม่พิมพ์ลากขึ้นรูป", page_icon="🔩", layout="wide")
 
 
@@ -39,18 +68,23 @@ def get_synth(n: int, seed: int) -> pd.DataFrame:
 
 
 def train_and_store(mode: str, kind: str, n_synth: int) -> None:
-    real = core.load_real(REAL_PATH)
+    real = get_real()
     with st.spinner("กำลังเทรนโมเดล…"):
         bundle = core.train(get_synth(n_synth, 0), real, mode=mode, kind=kind)
     bundle["trained_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M")
     bundle["n_synth"] = n_synth if mode == "mix" else 0
     st.session_state["bundle"] = bundle
+    if CLOUD:
+        return
     try:
         joblib.dump(bundle, MODEL_PATH)
     except Exception as e:  # เช่น โฟลเดอร์เขียนไม่ได้
         st.warning(f"บันทึกไฟล์โมเดลไม่สำเร็จ: {e}")
 
 
+if "bundle" not in st.session_state and CLOUD:
+    with st.spinner("กำลังเตรียมโมเดล…"):
+        st.session_state["bundle"] = default_bundle()
 if "bundle" not in st.session_state:
     loaded = None
     if MODEL_PATH.exists():
@@ -251,11 +285,11 @@ with tab_pred:
             if real_fbh <= 0:
                 st.error("ใส่แรงกดยึดจริงเป็นตัวเลขมากกว่า 0")
             else:
-                real = core.load_real(REAL_PATH)
+                real = get_real()
                 row = {**x, "F_BH_kN": real_fbh, "F_draw_kN": real_fd if real_fd > 0 else np.nan,
                        "material": mat_key, "note": note, "date": dt.date.today().isoformat()}
                 real = pd.concat([real, pd.DataFrame([row])], ignore_index=True)
-                core.save_real(real, REAL_PATH)
+                put_real(real)
                 st.success(f"เพิ่มแล้ว · ข้อมูลจริงในระบบ {len(real)} แถว — ไปที่แท็บ 'โมเดล ML' เพื่อเทรนใหม่")
 
 # ---------------- แท็บ: สูตรการคำนวณ ----------------
@@ -274,28 +308,74 @@ with tab_calc:
 
     # 0. การเลือกค่าอินพุต
     st.subheader("0. การหาค่าอินพุต")
-    with st.expander("วัสดุแผ่น: Rm, Re, r, μ", expanded=False):
-        st.markdown("**ความต้านแรงดึงและจุดคราก** จากใบรับรองวัสดุ หรือทดสอบแรงดึง (JIS Z 2241)")
-        st.latex(r"R_m=\frac{F_{max}}{A_0},\qquad R_e=\frac{F_{yield}}{A_0}")
+    with st.expander("วัสดุแผ่น: Rm, Re, r, μ — คืออะไร หามาจากไหน", expanded=False):
+        st.info("สรุปหน้างาน: ขอใบ **Mill Certificate (Mill sheet)** จากผู้ขายวัสดุทุกล็อต แล้วนำค่า Rm, Re, r มากรอก "
+                "จะแม่นกว่าค่าตั้งต้นในโปรแกรม เพราะวัสดุแต่ละล็อตต่างกันได้ ±10%")
+
+        st.markdown("#### Rm — ความต้านแรงดึงสูงสุด (Tensile Strength)")
+        st.markdown("แรงดึงสูงสุดต่อพื้นที่ที่วัสดุรับได้ก่อนขาด หน่วย MPa (= N/mm²)")
+        st.latex(r"R_m=\frac{F_{max}}{A_0},\qquad A_0=b_0\times t_0")
+        st.markdown("- **F_max** แรงดึงสูงสุดที่เครื่องทดสอบอ่านได้ (N)\n"
+                    "- **A₀** พื้นที่หน้าตัดชิ้นทดสอบก่อนดึง = ความกว้าง b₀ × ความหนา t₀ (mm²)")
+        st.latex(r"\text{ex. }b_0=25,\ t_0=0.8\Rightarrow A_0=20\ \text{mm}^2,\quad "
+                 r"F_{max}=6600\ \text{N}\Rightarrow R_m=\frac{6600}{20}=330\ \text{MPa}")
+        st.markdown("**หามาจาก**\n"
+                    "1. **Mill sheet** ช่อง **T.S.** หรือ **Tensile Strength** — ง่ายที่สุด เป็นค่าจริงของล็อตนั้น\n"
+                    "2. **ทดสอบแรงดึงเอง** ด้วยเครื่อง UTM ตาม JIS Z 2241 (หรือส่งห้องแล็บ)\n"
+                    "3. **ค่าตามมาตรฐาน** เช่น SPCC (JIS G 3141) กำหนดขั้นต่ำ 270 MPa ของจริงมัก 300–350 MPa "
+                    "— โปรแกรมใส่ค่าเฉลี่ยไว้ให้เมื่อเลือกวัสดุ")
+        st.caption("ผล: Rm สูง → ต้องใช้แรงลากและแรงกดยึดมากขึ้นตามสัดส่วน")
+
+        st.markdown("#### Re — จุดคราก (Yield Strength / Yield Point)")
+        st.markdown("แรงต่อพื้นที่ที่วัสดุเริ่มเสียรูปถาวร ดึงเกินจุดนี้แล้วปล่อย ชิ้นงานจะไม่คืนรูปเดิม")
+        st.latex(r"R_e=\frac{F_{yield}}{A_0}")
+        st.markdown("- **F_yield** แรงตอนวัสดุเริ่มคราก (N)\n\n"
+                    "**หามาจาก** Mill sheet ช่อง **Y.P.** (Yield Point) หรือ **Y.S.** (Yield Strength) — "
+                    "วัสดุที่ไม่มีจุดครากชัด เช่น สแตนเลส อะลูมิเนียม ใช้ค่า **Rp0.2** (แรงที่ทำให้ยืดถาวร 0.2%)")
         st.latex(rf"\frac{{R_e}}{{R_m}}=\frac{{{Re:.0f}}}{{{Rm:.0f}}}={Re / Rm:.2f}")
-        st.caption("อัตราส่วน Re/Rm ต่ำ (< 0.65) ลากลึกได้ดี · สูงมาก (> 0.8) ย่นและเด้งกลับง่าย")
-        st.markdown("**ค่า r (Lankford)** อัตราส่วนความเครียดตามกว้างต่อตามหนา")
-        st.latex(r"r=\frac{\varepsilon_w}{\varepsilon_t}=\frac{\ln(w_0/w)}{\ln(t_0/t)},\qquad "
-                 r"\bar r=\frac{r_0+2r_{45}+r_{90}}{4}")
+        ratio_txt = ("ลากลึกได้ดี" if Re / Rm < 0.65 else "ปานกลาง" if Re / Rm <= 0.8 else "ย่นและเด้งกลับง่าย ระวัง")
+        st.caption(f"อัตราส่วน Re/Rm < 0.65 เนื้อยืดดี ลากลึกได้ดี · > 0.8 ย่นและเด้งกลับ (spring-back) ง่าย "
+                   f"— วัสดุที่กรอกตอนนี้: {ratio_txt}")
+
+        st.markdown("#### r — ค่า Lankford (ค่าความต้านทานการบางตัว)")
+        st.markdown("บอกว่าตอนแผ่นถูกดึง เนื้อวัสดุหดทาง **ความกว้าง** มากกว่าทาง **ความหนา** แค่ไหน "
+                    "ค่ายิ่งสูง แผ่นยิ่งไม่บาง → ลากลึกได้ดี ไม่ขาดง่าย")
+        st.latex(r"r=\frac{\varepsilon_w}{\varepsilon_t}=\frac{\ln(w_0/w)}{\ln(t_0/t)}")
+        st.markdown("- **w₀, w** ความกว้างชิ้นทดสอบ ก่อน/หลัง ดึง\n"
+                    "- **t₀, t** ความหนา ก่อน/หลัง ดึง\n"
+                    "- **ε_w, ε_t** ความเครียด (strain) ตามกว้าง / ตามหนา\n\n"
+                    "แผ่นรีดมีทิศทาง จึงวัด 3 ทิศเทียบแนวรีด (0°, 45°, 90°) แล้วเฉลี่ย")
+        st.latex(r"\bar r=\frac{r_0+2r_{45}+r_{90}}{4}")
+        st.markdown("**หามาจาก**\n"
+                    "1. Mill sheet ของเหล็กเกรดลากลึก (SPCE, SPCF, DC04 ฯลฯ) มักระบุ **r-value**\n"
+                    "2. ทดสอบตาม ISO 10113 (ห้องแล็บ)\n"
+                    "3. ไม่มีข้อมูล → ใช้ค่าตั้งต้นในโปรแกรมได้ ผลคลาดเคลื่อนไม่มาก")
         st.caption(f"ค่าที่ใช้ r = {r_val:.2f} · เหล็กลากลึก 1.6–2.0 · SPCC 1.2–1.5 · สแตนเลส/อะลูมิเนียม 0.6–1.0")
-        st.markdown("**สัมประสิทธิ์แรงเสียดทาน μ** เลือกตามการหล่อลื่น")
+
+        st.markdown("#### μ — สัมประสิทธิ์แรงเสียดทาน")
+        st.markdown("บอกว่าผิวแผ่นลื่นแค่ไหนเมื่อไถลผ่านขอบดายและใต้แผ่นกดยึด วัดเองได้ยาก "
+                    "ในทางปฏิบัติ **เลือกตามการหล่อลื่นที่ใช้จริง**")
         st.table(pd.DataFrame({"การหล่อลื่น": ["น้ำมันลากขึ้นรูปอย่างดี / ฟิล์มพลาสติก", "น้ำมันทั่วไป", "แห้ง / ไม่หล่อลื่น"],
                                "μ": ["0.03–0.06", "0.08–0.12", "0.15–0.20"]}).set_index("การหล่อลื่น"))
 
-    with st.expander("ขนาดชิ้นงาน: t, dp, h, rd, rp, D0", expanded=False):
-        st.markdown("**เส้นผ่านศูนย์กลางพันช์** = ขนาดในของถ้วย ถ้าแบบให้ขนาดนอก")
+    with st.expander("ขนาดชิ้นงาน: t, dp, h, rd, rp, D0 — คืออะไร หามาจากไหน", expanded=False):
+        st.markdown("ขนาดทั้งหมดหาได้จาก **แบบชิ้นงาน (drawing)** ส่วนรัศมีดายและพันช์เลือกตอนออกแบบแม่พิมพ์")
+        st.table(pd.DataFrame({
+            "สัญลักษณ์": ["t", "dp", "h", "rp", "rd", "D0", "d_out, H_out", "D0,trim"],
+            "ความหมาย": ["ความหนาแผ่น", "เส้นผ่านศูนย์กลางพันช์ = ขนาดในของถ้วย", "ความลึกการลาก ≈ ความสูงในของถ้วย",
+                         "รัศมีมุมพันช์ = รัศมีมุมในก้นถ้วย", "รัศมีขอบปากดาย", "เส้นผ่านศูนย์กลางแผ่นเปล่าก่อนลาก",
+                         "ขนาดนอก / ความสูงนอก ตามแบบ", "แผ่นเปล่าที่เผื่อขอบไว้ตัดแต่งหลังลาก"],
+            "หามาจาก": ["แบบชิ้นงาน / Mill sheet", "แบบชิ้นงาน (ถ้าให้ขนาดนอก ลบ 2t)", "แบบชิ้นงาน (ถ้าให้ความสูงนอก ลบ t)",
+                        "แบบชิ้นงาน", "ออกแบบแม่พิมพ์ 5–10t", "คำนวณ (หัวข้อที่ 1)", "แบบชิ้นงาน", "D0 × 1.02–1.05"],
+        }).set_index("สัญลักษณ์"))
+        st.markdown("**เส้นผ่านศูนย์กลางพันช์** — ถ้าแบบให้ขนาดนอก")
         st.latex(rf"d_p=d_{{out}}-2t\qquad(\text{{ex. }}d_{{out}}={dp + 2 * t:.1f}\Rightarrow d_p={dp:.1f})")
-        st.markdown("**ความลึกการลาก** ≈ ความสูงถ้วยด้านใน (ถ้าแบบให้ความสูงนอก)")
+        st.markdown("**ความลึกการลาก** — ถ้าแบบให้ความสูงนอก")
         st.latex(rf"h=H_{{out}}-t\qquad(\text{{ex. }}H_{{out}}={h + t:.1f}\Rightarrow h={h:.1f})")
-        st.markdown("**รัศมีพันช์และรัศมีดาย**")
+        st.markdown("**รัศมีพันช์และรัศมีดาย** — rd เล็กไป = ชิ้นงานขาดที่มุม, ใหญ่ไป = ย่นที่ปากถ้วย")
         st.latex(rf"r_p\approx(4\text{{–}}8)\,t={4 * t:.1f}\text{{–}}{8 * t:.1f}\ \text{{mm}},\qquad "
                  rf"r_d\approx(5\text{{–}}10)\,t={5 * t:.1f}\text{{–}}{10 * t:.1f}\ \text{{mm}}")
-        st.markdown("**แผ่นเปล่ารวมขอบตัดแต่ง**")
+        st.markdown("**แผ่นเปล่ารวมขอบตัดแต่ง** — ขอบถ้วยหลังลากมักไม่เรียบ (earing) ต้องเผื่อไว้ตัด")
         D0_trim = core.blank_diameter(dp, h, rp, t)
         st.latex(rf"D_{{0,trim}}=D_0\times(1.02\text{{–}}1.05)={D0_trim * 1.02:.1f}\text{{–}}{D0_trim * 1.05:.1f}\ \text{{mm}}")
         st.caption("รายละเอียดสูตร D0 อยู่ในหัวข้อที่ 1")
@@ -402,7 +482,7 @@ with tab_calc:
 
 # ---------------- แท็บ 2: โมเดล ----------------
 with tab_model:
-    real_now = core.load_real(REAL_PATH)
+    real_now = get_real()
     c1, c2, c3, c4 = st.columns([1.3, 1.3, 1, 1])
     kind = c1.selectbox("ชนิดโมเดล", list(core.MODEL_KINDS), format_func=core.MODEL_KINDS.get,
                         index=list(core.MODEL_KINDS).index(bundle["kind"]))
@@ -486,21 +566,21 @@ with tab_data:
         try:
             raw = pd.read_excel(up) if up.name.lower().endswith(("xlsx", "xls")) else pd.read_csv(up, sep=None, engine="python")
             new, skipped = core.clean_real(raw)
-            real = pd.concat([core.load_real(REAL_PATH), new], ignore_index=True)
-            core.save_real(real, REAL_PATH)
+            real = pd.concat([get_real(), new], ignore_index=True)
+            put_real(real)
             st.success(f"นำเข้า {len(new)} แถว" + (f" (ข้าม {skipped} แถวที่ข้อมูลไม่ครบ)" if skipped else "")
                        + f" · รวม {len(real)} แถว")
         except Exception as e:
             st.error(f"อ่านไฟล์ไม่สำเร็จ: {e}")
 
-    real = core.load_real(REAL_PATH)
+    real = get_real()
     st.markdown(f"**ข้อมูลจริงในระบบ: {len(real)} แถว** (แก้ไข เพิ่ม หรือลบแถวในตารางได้ แล้วกดบันทึก)")
     edited = st.data_editor(real, num_rows="dynamic", use_container_width=True, key="editor")
     b1, b2, b3 = st.columns(3)
     if b1.button("บันทึกการแก้ไข"):
         try:
             cleaned, skipped = core.clean_real(edited)
-            core.save_real(cleaned, REAL_PATH)
+            put_real(cleaned)
             st.success(f"บันทึก {len(cleaned)} แถว" + (f" (ตัด {skipped} แถวที่ข้อมูลไม่ครบ)" if skipped else ""))
         except ValueError as e:
             st.error(str(e))
@@ -509,4 +589,8 @@ with tab_data:
     template = pd.DataFrame(columns=core.REAL_COLUMNS)
     b3.download_button("ดาวน์โหลดแม่แบบ (CSV)", template.to_csv(index=False).encode("utf-8-sig"),
                        "real_data_template.csv", "text/csv")
-    st.caption(f"ไฟล์ข้อมูลเก็บที่ {REAL_PATH}")
+    if CLOUD:
+        st.info("เวอร์ชันออนไลน์: ข้อมูลที่เพิ่มจะอยู่เฉพาะในหน้านี้ของคุณ และหายเมื่อปิดหรือรีเฟรชหน้า "
+                "กด 'ดาวน์โหลดข้อมูลจริง' เก็บไว้ก่อนปิด แล้วครั้งหน้านำเข้าไฟล์เดิมได้")
+    else:
+        st.caption(f"ไฟล์ข้อมูลเก็บที่ {REAL_PATH}")
