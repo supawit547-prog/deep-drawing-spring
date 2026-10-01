@@ -29,6 +29,7 @@ MATERIALS: dict[str, dict] = {
     "SPCC":   {"name": "SPCC (เหล็กแผ่นรีดเย็น)",   "Rm": 330, "Re": 210, "r": 1.4, "c": 2.5, "bmax": 2.0},
     "SPCE":   {"name": "SPCE / DC04 (เหล็กลากลึก)", "Rm": 300, "Re": 170, "r": 1.8, "c": 2.5, "bmax": 2.1},
     "SPHC":   {"name": "SPHC (เหล็กรีดร้อน)",       "Rm": 340, "Re": 230, "r": 1.0, "c": 2.5, "bmax": 1.9},
+    "SGCC":   {"name": "SGCC (เหล็กชุบสังกะสี)",     "Rm": 291, "Re": 230, "r": 1.3, "c": 3.0, "bmax": 2.0},
     "SUS304": {"name": "SUS304 (สแตนเลส)",          "Rm": 600, "Re": 260, "r": 1.0, "c": 3.0, "bmax": 2.0},
     "SUS430": {"name": "SUS430 (สแตนเลส)",          "Rm": 480, "Re": 290, "r": 1.2, "c": 2.8, "bmax": 1.9},
     "A1100":  {"name": "อะลูมิเนียม A1100-O",        "Rm": 95,  "Re": 35,  "r": 0.8, "c": 2.0, "bmax": 2.0},
@@ -61,41 +62,74 @@ FEATURE_TH = {
 # ---------------------------------------------------------------------------
 # ฟิสิกส์ (สูตรเชิงประสบการณ์)
 # ---------------------------------------------------------------------------
-def physics(x, c=2.5, bmax=2.0, extras: bool = False) -> dict:
-    """คำนวณแรงกดยึด (Siebel) และแรงลาก — รับ dict หรือ DataFrame (vectorized)
+PHYSICS_VERSION = 2  # 2 = สูตรตามแบบเสนอโครงงาน (สมการ 5.5–5.14)
+ETA_BASE = 0.6       # η_def ที่ใช้ในค่าพื้นฐานของ ML (กึ่งกลางช่วง 0.5–0.7)
 
-    p [MPa] = c·10⁻³·[(β−1)² + D0/(200·t)]·Rm
-    F_BH    = p · A_flange
-    F_draw  = π·(dp+t)·t·Rm·n + 2·μ·F_BH
+
+def bh_pressure(beta, D0, t, Rm, C=3.0):
+    """(5.5) P_BH = 10⁻³·C·[(β−1)³ + 0.005·d0/T]·σu   [N/mm²]"""
+    return C * 1e-3 * ((beta - 1) ** 3 + 0.005 * D0 / t) * Rm
+
+
+def bh_area(D0, dp):
+    """(5.6) A_BH = π/4·(d0² − d1²)   [mm²]"""
+    return np.pi / 4 * (np.asarray(D0, dtype=float) ** 2 - np.asarray(dp, dtype=float) ** 2)
+
+
+def fmax_draw(dp, t, D0, Rm, eta=0.5):
+    """(5.14) Fmax = π·dm·T·[1.1·(1.3·σu/η_def)·(ln(d0/d1) − 0.25)]   [N]  ,  dm = d1 + T"""
+    dm = dp + t
+    term = np.maximum(np.log(np.asarray(D0, dtype=float) / dp) - 0.25, 0.02)
+    return np.pi * dm * t * 1.1 * (1.3 * Rm / eta) * term
+
+
+def fcr_crack(dp, t, Rm, acr):
+    """(5.7) Fcr = π·dm·T·σu·a_cr   [N]"""
+    return np.pi * (dp + t) * t * Rm * acr
+
+
+# (5.1) ตัวคูณการแตก a_cr ตามกลุ่มวัสดุ (ต่ำสุด, สูงสุด)
+ACR = {"steel": (1.05, 1.55), "sus": (0.95, 1.30), "brass": (0.92, 1.27), "al": (0.99, 1.22)}
+MAT_FAMILY = {"SPCC": "steel", "SPCE": "steel", "SPHC": "steel", "SGCC": "steel", "SUS304": "sus",
+              "SUS430": "sus", "A1100": "al", "A5052": "al", "C2680": "brass", "C1100": "brass", "custom": "steel"}
+
+
+def physics(x, c=3.0, bmax=2.0, extras: bool = False, eta: float = ETA_BASE) -> dict:
+    """คำนวณตามสูตรในแบบเสนอโครงงาน — รับ dict หรือ DataFrame (vectorized)
+
+    (5.5) P_BH = 10⁻³·C·[(β−1)³ + 0.005·d0/T]·σu
+    (5.6) F_BH = P_BH · π/4·(d0² − d1²)
+    (5.14) Fmax = π·dm·T·[1.1·(1.3·σu/η)·(ln(d0/d1) − 0.25)]
+    extras=True ใช้ตอนสร้างข้อมูลจำลอง: เพิ่มผลของค่า r, Re/Rm, rd/t และแรงเสียดทาน 2μF_BH
     """
     g = {k: np.asarray(x[k], dtype=float) for k in FEATURES}
     t, D0, dp, rd, Rm, Re, r, mu = g["t"], g["D0"], g["dp"], g["rd"], g["Rm"], g["Re"], g["r"], g["mu"]
     c = np.asarray(c, dtype=float)
-    bmax = np.asarray(bmax, dtype=float)
 
     beta = D0 / dp
-    p = c * 1e-3 * ((beta - 1) ** 2 + D0 / (200 * t)) * Rm
-    if extras:  # ผลกระทบเพิ่มเติมที่ใช้ตอนสร้างข้อมูลจำลอง
+    p = bh_pressure(beta, D0, t, Rm, c)
+    if extras:
         p = p * (2.6 / (1 + r)) ** 0.25 * ((Re / Rm) / 0.6) ** 0.3 * (1 + 0.8 * (t / rd - 0.15))
-    di = dp + 2 * rd + 2 * t
-    area = np.pi / 4 * (D0 ** 2 - di ** 2)
+    area = bh_area(D0, dp)
     fbh = np.maximum(p * area, 0) / 1000.0  # kN
-    n = np.clip(1.2 * (beta - 1) / (bmax - 1), 0.3, 1.25)
-    fd = np.pi * (dp + t) * t * Rm * n / 1000.0 + 2 * mu * fbh * (1.1 if extras else 1.0)
-    return {"F_BH_kN": fbh, "F_draw_kN": fd, "beta": beta, "area": area}
+    fd = fmax_draw(dp, t, D0, Rm, eta) / 1000.0
+    if extras:
+        fd = fd * (1 + 1.5 * (mu - 0.1)) + 2 * mu * fbh
+    return {"F_BH_kN": fbh, "F_draw_kN": fd, "beta": beta, "area": area, "p": p}
 
 
 def blank_diameter(dp: float, h: float, rp: float = 0.0, t: float = 0.0) -> float:
-    """เส้นผ่านศูนย์กลางแผ่นเปล่าของถ้วยทรงกระบอก (พื้นที่ผิวคงที่)
-    D0 = √(d² + 4·d·h − 1.72·d·r − 0.56·r²)   โดย d = dp + t (เส้นผ่านศูนย์กลางกลางเนื้อ), r = รัศมีก้นถ้วย"""
-    d = dp + t
-    val = d * d + 4 * d * h - 1.72 * d * rp - 0.56 * rp * rp
-    return math.sqrt(max(val, d * d))
+    """(5.13) d0 = √(d1² + 4·(1.57·r·d1 + 2r² + h·d2))
+    d1 = ขนาดก้นเรียบ = dp − 2r · d2 = dp · h = ความสูงผนังตรง = h_รวม − r · r = รัศมีพั้นช์"""
+    r = max(rp, 0.0)
+    d1 = max(dp - 2 * r, 0.0)
+    hw = max(h - r, 0.0)
+    return math.sqrt(d1 ** 2 + 4 * (1.57 * r * d1 + 2 * r ** 2 + hw * dp))
 
 
 # ค่าเพิ่มเติมต่อวัสดุ: k ในสูตรระยะช่องว่าง (Oehler) และอัตราส่วนการลากครั้งถัดไป
 MAT_EXTRA = {
-    "SPCC": (0.07, 1.25), "SPCE": (0.07, 1.28), "SPHC": (0.07, 1.22),
+    "SPCC": (0.07, 1.30), "SPCE": (0.07, 1.30), "SPHC": (0.07, 1.30), "SGCC": (0.07, 1.30),
     "SUS304": (0.07, 1.20), "SUS430": (0.07, 1.20),
     "A1100": (0.02, 1.25), "A5052": (0.02, 1.20),
     "C2680": (0.04, 1.30), "C1100": (0.04, 1.30), "custom": (0.07, 1.25),
@@ -109,8 +143,8 @@ def die_clearance(t: float, mat_key: str) -> float:
 
 
 def die_radius_recommend(D0: float, dp: float, t: float) -> float:
-    """รัศมีขอบดายแนะนำ (Kaczmarek): rd = 0.8·√((D0 − dp)·t)"""
-    return 0.8 * math.sqrt(max(D0 - dp, 0) * t)
+    """(5.10) Oehler & Kaiser: R_D = 0.035·[50 + (d0 − d1)]·√T"""
+    return 0.035 * (50 + (D0 - dp)) * math.sqrt(t)
 
 
 def draw_stages(D0: float, dp: float, mat_key: str) -> list[float]:
@@ -241,7 +275,7 @@ def make_model(kind: str = "gb", seed: int = 0):
 def baseline(df) -> tuple[np.ndarray, np.ndarray]:
     """ค่าจากสูตร Siebel แบบทั่วไป (c=2.5, βmax=2.0) — โมเดลเรียนรู้ 'ค่าแก้' เทียบกับค่านี้
     (physics-informed residual) ทำให้เทรนด้วยข้อมูลจริงจำนวนน้อยได้ดีขึ้นมาก"""
-    ph = physics(df, 2.5, 2.0)
+    ph = physics(df, 3.0, 2.0)
     return np.atleast_1d(ph["F_BH_kN"]), np.atleast_1d(ph["F_draw_kN"])
 
 
@@ -305,6 +339,7 @@ def train(synth: pd.DataFrame, real: pd.DataFrame, mode: str = "mix", kind: str 
     importance = pd.Series(pi.importances_mean, index=FEATURES).sort_values()
 
     return {
+        "physics_version": PHYSICS_VERSION,
         "model_bh": model_bh, "model_fd": model_fd, "metrics": metrics,
         "test": te[FEATURES + TARGETS + ["pred_F_BH_kN", "is_real"]].reset_index(drop=True),
         "importance": importance,
@@ -358,8 +393,8 @@ def check_warnings(x: dict, mat: dict, design: dict, ranges: dict | None) -> lis
     if design["best"] is None:
         w.append(("error", f"ระยะยุบ {design['defl_pct']:.0f}% เกินทุกคลาส ต้องใช้สปริงยาวอย่างน้อย "
                            f"{design['smax'] / 0.5:.0f} มม. หรือเปลี่ยนเป็น gas spring"))
-    if x["rd"] < 4 * x["t"]:
-        w.append(("warning", f"รัศมีขอบดาย {x['rd']:.1f} มม. เล็กกว่า 4t อาจขาดที่มุม (แนะนำ 5–10t)"))
+    if x["rd"] < 5 * x["t"]:
+        w.append(("warning", f"รัศมีดาย {x['rd']:.1f} มม. เล็กกว่า 5T อาจขาดที่มุม (สมการ 5.11 แนะนำ R_D = 5–10T)"))
     if x["Re"] >= x["Rm"]:
         w.append(("error", "จุดคราก Re ต้องน้อยกว่า Rm"))
     if ranges:
@@ -367,3 +402,8 @@ def check_warnings(x: dict, mat: dict, design: dict, ranges: dict | None) -> lis
         if out:
             w.append(("warning", "ค่า " + ", ".join(out) + " อยู่นอกช่วงข้อมูลที่ใช้เทรน ผลทำนายอาจคลาดเคลื่อนมาก"))
     return w
+
+
+def cushion_air_pressure(F_kN: float, cap_kN: float = 63.0, p_rated: float = 0.5) -> float:
+    """แรงดันลมดายคูชั่นที่ต้องตั้ง (MPa) — แปรผันตรงกับแรง: P = F / F_rated × P_rated"""
+    return F_kN / cap_kN * p_rated

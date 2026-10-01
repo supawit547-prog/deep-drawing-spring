@@ -97,6 +97,12 @@ if "bundle" not in st.session_state:
     else:
         train_and_store("mix", "mlp", 3000)
 
+if st.session_state["bundle"].get("physics_version") != core.PHYSICS_VERSION:
+    # โมเดลเก่าสร้างจากสูตรชุดเดิม → เทรนใหม่ด้วยสูตรปัจจุบัน
+    if CLOUD:
+        st.session_state["bundle"] = default_bundle()
+    else:
+        train_and_store("mix", "mlp", 3000)
 bundle = st.session_state["bundle"]
 
 # ---------------------------------------------------------------------------
@@ -108,11 +114,13 @@ sb = st.sidebar
 # บันทึก / เปิดงาน — ค่าในแถบซ้ายเก็บใน session_state ตาม key ของแต่ละช่อง
 # ---------------------------------------------------------------------------
 DEFAULTS = {"mat": "SPCC", "mu": 0.10, "t": 1.0, "dp": 60.0, "h": 25.0, "rd": 6.0, "rp": 5.0,
-            "auto_d0": False, "D0": 110.0, "N": 4, "s0": 15.0, "margin": 3.0, "L0": 150.0, "sf": 1.15, "std": "iso"}
-NUM_KEYS = ["mu", "t", "dp", "h", "rd", "rp", "D0", "s0", "margin", "L0", "sf"]
+            "auto_d0": False, "D0": 110.0, "N": 4, "s0": 15.0, "margin": 3.0, "L0": 150.0, "sf": 1.15, "std": "iso",
+            "C": 3.0, "eta": 0.5}
+NUM_KEYS = ["mu", "t", "dp", "h", "rd", "rp", "D0", "s0", "margin", "L0", "sf", "C", "eta"]
 LIMITS = {"mu": (0.01, 0.5), "t": (0.1, None), "dp": (1.0, None), "h": (0.5, None), "rd": (0.1, None),
           "rp": (0.0, None), "D0": (1.0, None), "s0": (0.5, None), "margin": (0.0, None), "L0": (5.0, None),
-          "sf": (1.0, None), "Rm": (1.0, None), "Re": (1.0, None), "r": (0.1, None)}
+          "sf": (1.0, None), "Rm": (1.0, None), "Re": (1.0, None), "r": (0.1, None),
+          "C": (1.5, 3.5), "eta": (0.4, 0.8)}
 
 
 def _clamp(k: str, v) -> float:
@@ -187,16 +195,23 @@ dp = c2.number_input("พันช์ dp", min_value=1.0, step=1.0, key="dp",
 h = c1.number_input("ความลึก h", min_value=0.5, step=1.0, key="h",
                     help="ระยะที่พันช์ลงไปในดาย ≈ ความสูงถ้วย (วัดด้านใน) ไม่รวมขอบตัดแต่ง")
 rd = c2.number_input("รัศมีดาย rd", min_value=0.1, step=0.5, key="rd",
-                     help="รัศมีขอบปากดาย · ทั่วไป 5–10t หรือ rd = 0.8·√((D0 − dp)·t) · เล็กไป = ขาด, ใหญ่ไป = ย่น")
+                     help="รัศมีขอบปากดาย · (5.10) R_D = 0.035·[50 + (d0 − d1)]·√T หรือ (5.11) R_D = (5–10)·T · เล็กไป = ขาด, ใหญ่ไป = ย่น")
 rp = c1.number_input("รัศมีพันช์ rp", min_value=0.0, step=0.5, key="rp",
-                     help="= รัศมีมุมในก้นถ้วยตามแบบ · ทั่วไป 4–8t · ใช้คำนวณขนาดแผ่นเปล่า")
+                     help="= รัศมีมุมในก้นถ้วยตามแบบ · (5.12) r_p = (3–5)·r_d · ใช้คำนวณขนาดแผ่นเปล่า (5.13)")
 auto_d0 = sb.checkbox("คำนวณ D0 จาก dp และ h อัตโนมัติ", key="auto_d0")
 if auto_d0:
     D0 = round(core.blank_diameter(dp, h, rp, t), 1)
     sb.markdown(f"**D0 = {D0:.1f} มม.**")
 else:
     D0 = sb.number_input("แผ่นเปล่า D0", min_value=1.0, step=1.0, key="D0",
-                         help="D0 = √(d² + 4dh − 1.72·d·rp − 0.56·rp²), d = dp + t · บวกเผื่อขอบตัดแต่ง 2–5%")
+                         help="(5.13) d0 = √(d1² + 4·(1.57·r·d1 + 2r² + h·d2)) · d1 = dp − 2rp, d2 = dp, h = ความสูงผนังตรง")
+
+sb.header("ค่าคงที่ในสูตร")
+c1, c2 = sb.columns(2)
+C_const = c1.number_input("ค่าคงที่ C", min_value=1.5, max_value=3.5, step=0.1, key="C",
+                          help="สมการ (5.5) แรงดันแผ่นจับชิ้นงาน · C มีค่าระหว่าง 2–3")
+eta = c2.number_input("ประสิทธิภาพ η_def", min_value=0.4, max_value=0.8, step=0.05, key="eta",
+                      help="สมการ (5.14) แรงสูงสุดในการลาก · η_def มีค่าระหว่าง 0.5–0.7 (ค่าน้อย = แรงมาก = ปลอดภัยกว่า)")
 
 sb.header("การจัดวางสปริง")
 c1, c2 = sb.columns(2)
@@ -226,7 +241,7 @@ job_data = {
     "saved_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
     "inputs": {"mat": mat_key, "Rm": Rm, "Re": Re, "r": r_val, "mu": mu, "t": t, "dp": dp, "h": h, "rd": rd,
                "rp": rp, "auto_d0": auto_d0, "D0": D0, "N": N, "s0": s0, "margin": margin, "L0": L0, "sf": sf,
-               "std": std},
+               "std": std, "C": C_const, "eta": eta},
     "results": {"F_BH_kN": round(_fbh_s, 3), "spring_k_N_per_mm": round(_des_s["k"], 1),
                 "F_draw_kN": round(_fd_s, 2) if _fd_s else None, "spring_class": _des_s["best"],
                 "note": "ผลลัพธ์ ณ เวลาบันทึก ใช้อ้างอิงเท่านั้น เปิดงานแล้วโปรแกรมจะคำนวณใหม่"},
@@ -249,24 +264,34 @@ tab_pred, tab_calc, tab_model, tab_data = st.tabs(
 
 # ---------------- แท็บ 1: ทำนาย ----------------
 with tab_pred:
-    ph = core.physics(x, mat["c"], mat["bmax"])
+    ph = core.physics(x, C_const, mat["bmax"], eta=eta)
     if float(ph["area"]) <= 0:
-        st.error("แผ่นเปล่าเล็กเกินไป: D0 ต้องมากกว่า dp + 2·rd + 2·t จึงจะมีพื้นที่ให้แผ่นกดยึด")
+        st.error("แผ่นเปล่าเล็กเกินไป: D0 ต้องมากกว่า dp จึงจะมีพื้นที่ให้แผ่นจับชิ้นงานกด")
         st.stop()
+    fam = core.MAT_FAMILY.get(mat_key, "steel")
+    acr_lo, acr_hi = core.ACR[fam]
+    fmax_f = float(ph["F_draw_kN"])
+    fcr_lo = core.fcr_crack(dp, t, Rm, acr_lo) / 1000
+    fcr_hi = core.fcr_crack(dp, t, Rm, acr_hi) / 1000
 
     fbh_ml, fd_ml = core.predict(bundle, x)
     fd = fd_ml if fd_ml is not None else float(ph["F_draw_kN"])
     des = core.spring_design(fbh_ml, N, s0, h, margin, L0, sf)
-    press_ton = (fd + des["F_end_total"] / 1000) * 1.3 / 9.80665
+    press_ton = (fd + des["F_end_total"] / 1000) * 1.5 / 9.80665
 
     m1, m2, m3 = st.columns(3)
     m1.metric("แรงกดยึดชิ้นงาน (ML)", f"{fbh_ml:.2f} kN",
-              delta=f"{(fbh_ml / float(ph['F_BH_kN']) - 1) * 100:+.0f}% เทียบสูตร Siebel", delta_color="off")
+              delta=f"{(fbh_ml / float(ph['F_BH_kN']) - 1) * 100:+.0f}% เทียบสูตร (5.5)–(5.6)", delta_color="off")
     m2.metric("ค่าคงที่สปริงต่อตัว", f"{des['k']:.1f} N/มม.",
               delta=f"{N} ตัว · ตัวละ {des['F0_each'] / 1000:.2f} kN", delta_color="off")
     m3.metric("แรงลากขึ้นรูป", f"{fd:.1f} kN", delta=f"เครื่องเพรส ≈ {press_ton:.1f} ตัน", delta_color="off")
-    st.caption(f"สูตร Siebel: แรงกดยึด {float(ph['F_BH_kN']):.2f} kN · β = {float(ph['beta']):.2f} · "
-               "ขนาดเครื่องรวมแรงสปริงท้ายจังหวะ เผื่อ 30%")
+    st.caption(f"ตามสูตร: แรงกดยึด (5.6) {float(ph['F_BH_kN']):.2f} kN · แรงลากสูงสุด (5.14) {fmax_f:.1f} kN · "
+               f"แรงที่ทำให้แตก (5.7) {fcr_lo:.1f}–{fcr_hi:.1f} kN · β = {float(ph['beta']):.2f} · "
+               "ขนาดเครื่อง = 1.5 × (แรงลาก + แรงกดยึดท้ายจังหวะ)")
+    if fmax_f >= fcr_lo:
+        (st.error if fmax_f >= fcr_hi else st.warning)(
+            f"แรงลากสูงสุด Fmax = {fmax_f:.1f} kN {'มากกว่า' if fmax_f >= fcr_hi else 'ใกล้หรือเกิน'}แรงที่ทำให้แตก "
+            f"Fcr = {fcr_lo:.1f}–{fcr_hi:.1f} kN (a_cr {acr_lo}–{acr_hi}) — เสี่ยงก้นถ้วยขาด ควรลด β หรือเพิ่มรัศมี")
 
     for level, msg in core.check_warnings(x, mat, des, bundle.get("ranges")):
         (st.error if level == "error" else st.warning)(msg)
@@ -318,10 +343,8 @@ with tab_calc:
                "ค่าคงที่ในสูตรเชิงประสบการณ์เป็นค่าประมาณ ควรยืนยันด้วยการลองแม่พิมพ์")
 
     beta = float(ph["beta"])
-    p_bh = mat["c"] * 1e-3 * ((beta - 1) ** 2 + D0 / (200 * t)) * Rm
-    di = dp + 2 * rd + 2 * t
+    p_bh = float(ph["p"])
     area = float(ph["area"])
-    n_fac = min(max(1.2 * (beta - 1) / (mat["bmax"] - 1), 0.3), 1.25)
     f_siebel = float(ph["F_BH_kN"])
     base_bh, _ = core.baseline(pd.DataFrame([x]))
     corr = fbh_ml / float(base_bh[0])
@@ -393,8 +416,8 @@ with tab_calc:
         st.markdown("**ความลึกการลาก** — ถ้าแบบให้ความสูงนอก")
         st.latex(rf"h=H_{{out}}-t\qquad(\text{{ex. }}H_{{out}}={h + t:.1f}\Rightarrow h={h:.1f})")
         st.markdown("**รัศมีพันช์และรัศมีดาย** — rd เล็กไป = ชิ้นงานขาดที่มุม, ใหญ่ไป = ย่นที่ปากถ้วย")
-        st.latex(rf"r_p\approx(4\text{{–}}8)\,t={4 * t:.1f}\text{{–}}{8 * t:.1f}\ \text{{mm}},\qquad "
-                 rf"r_d\approx(5\text{{–}}10)\,t={5 * t:.1f}\text{{–}}{10 * t:.1f}\ \text{{mm}}")
+        st.latex(rf"r_d=(5\text{{–}}10)\,T={5 * t:.1f}\text{{–}}{10 * t:.1f}\ \text{{mm}},\qquad "
+                 rf"r_p=(3\text{{–}}5)\,r_d={3 * rd:.1f}\text{{–}}{5 * rd:.1f}\ \text{{mm}}")
         st.markdown("**แผ่นเปล่ารวมขอบตัดแต่ง** — ขอบถ้วยหลังลากมักไม่เรียบ (earing) ต้องเผื่อไว้ตัด")
         D0_trim = core.blank_diameter(dp, h, rp, t)
         st.latex(rf"D_{{0,trim}}=D_0\times(1.02\text{{–}}1.05)={D0_trim * 1.02:.1f}\text{{–}}{D0_trim * 1.05:.1f}\ \text{{mm}}")
@@ -421,67 +444,81 @@ with tab_calc:
         st.markdown("**ตัวคูณเผื่อแรง** SF ≈ 1.1–1.3 เผื่อความแปรปรวนวัสดุและสปริงล้าเมื่อใช้งานนาน")
 
     # 1. ขนาดแผ่นเปล่า
-    st.subheader("1. ขนาดแผ่นเปล่าและจำนวนครั้งการลาก")
-    d_m = dp + t
+    st.subheader("1. ขนาดแผ่นเปล่าและขั้นตอนการลาก")
+    d1b = max(dp - 2 * rp, 0.0)
+    hw = max(h - rp, 0.0)
     D0_calc = core.blank_diameter(dp, h, rp, t)
-    st.markdown("**ขนาดแผ่นเปล่า** (พื้นที่ผิวคงที่ ถ้วยทรงกระบอกมีรัศมีก้น)")
-    st.latex(r"D_0=\sqrt{d^2+4dh-1.72\,d\,r_p-0.56\,r_p^2}\quad,\; d=d_p+t")
-    st.latex(rf"D_0=\sqrt{{{d_m:.1f}^2+4({d_m:.1f})({h:.1f})-1.72({d_m:.1f})({rp:.1f})-0.56({rp:.1f})^2}}"
-             rf"={D0_calc:.1f}\ \text{{mm}}")
-    st.caption(f"ค่า D0 ที่ใช้คำนวณตอนนี้ = {D0:.1f} มม. — ควรเผื่อขอบตัดแต่ง (trim) เพิ่มอีกประมาณ 2–5% ตามขนาดชิ้นงาน")
+    st.markdown("**ขนาดแผ่นโลหะเปล่า** สมการ (5.13)")
+    st.latex(r"d_0=\sqrt{d_1^2+4\,(1.57\,r\,d_1+2r^2+h\,d_2)}")
+    st.latex(rf"d_1=d_p-2r={dp:.1f}-2({rp:.1f})={d1b:.1f},\quad d_2=d_p={dp:.1f},\quad h=h_{{total}}-r={h:.1f}-{rp:.1f}={hw:.1f}")
+    st.latex(rf"d_0=\sqrt{{{d1b:.1f}^2+4\,[1.57({rp:.1f})({d1b:.1f})+2({rp:.1f})^2+({hw:.1f})({dp:.1f})]}}={D0_calc:.2f}\ \text{{mm}}")
+    st.caption(f"ค่า D0 ที่ใช้คำนวณตอนนี้ = {D0:.1f} มม. · d1 = เส้นผ่านศูนย์กลางก้นเรียบ, d2 = เส้นผ่านศูนย์กลางถ้วย, "
+               "r = รัศมีพั้นช์, h = ความสูงผนังตรง")
 
-    st.markdown("**อัตราส่วนการลาก** (β) และสัมประสิทธิ์การลาก (m)")
-    st.latex(rf"\beta=\frac{{D_0}}{{d_p}}=\frac{{{D0:.1f}}}{{{dp:.1f}}}={beta:.3f}"
-             rf"\qquad m=\frac{{1}}{{\beta}}={1 / beta:.3f}\qquad \beta_{{max}}\approx{mat['bmax']}")
+    st.markdown("**อัตราส่วนการลากขึ้นรูป** สมการ (5.8)")
+    st.latex(rf"\beta=\frac{{d_0}}{{d_1}}=\frac{{{D0:.1f}}}{{{dp:.1f}}}={beta:.2f}\qquad \beta_{{max}}={mat['bmax']}")
     stages = core.draw_stages(D0, dp, mat_key)
     bnext = core.MAT_EXTRA.get(mat_key, (0.07, 1.25))[1]
-    st.latex(rf"d_1=\frac{{D_0}}{{\beta_{{max}}}},\quad d_n=\frac{{d_{{n-1}}}}{{\beta_{{next}}}}"
-             rf"\quad(\beta_{{next}}\approx{bnext})")
     if len(stages) == 1:
-        st.success(f"ลากครั้งเดียวได้ (β = {beta:.2f} ≤ {mat['bmax']})")
+        st.success(f"β = {beta:.2f} ≤ βmax = {mat['bmax']} → ลากขึ้นรูปได้ในขั้นตอนเดียว")
     else:
-        st.warning(f"ต้องลากประมาณ {len(stages)} ครั้ง: " +
-                   " → ".join(f"Ø{d:.1f}" for d in stages[:-1]) + f" → Ø{dp:.1f} มม. (ขั้นสุดท้าย)")
+        st.warning(f"β = {beta:.2f} > βmax = {mat['bmax']} → ต้องลากประมาณ {len(stages)} ครั้ง: "
+                   + " → ".join(f"Ø{d:.1f}" for d in stages[:-1]) + f" → Ø{dp:.1f} มม.")
+        st.caption(f"ลากซ้ำใช้ β ≈ {bnext} (ไม่อบอ่อน) หรือ 1.7 (หลังอบอ่อน) ตามตารางที่ 5.2")
 
     # 2. แม่พิมพ์
     st.subheader("2. ขนาดแม่พิมพ์")
     kc = core.MAT_EXTRA.get(mat_key, (0.07, 1.25))[0]
     clr = core.die_clearance(t, mat_key)
-    rd_rec = core.die_radius_recommend(D0, dp, t)
-    st.markdown("**ระยะช่องว่างพันช์–ดาย ต่อข้าง** (Oehler)")
-    st.latex(rf"c=t+k\sqrt{{10t}}={t:.2f}+{kc}\sqrt{{10({t:.2f})}}={clr:.3f}\ \text{{mm}}")
-    st.latex(rf"d_{{die}}=d_p+2c={dp:.1f}+2({clr:.3f})={dp + 2 * clr:.2f}\ \text{{mm}}")
-    st.caption("k ≈ 0.07 เหล็ก/สแตนเลส · 0.04 ทองแดง/ทองเหลือง · 0.02 อะลูมิเนียม — งานที่ต้องการผนังเรียบแม่นยำ (ironing) ใช้ช่องว่างน้อยกว่านี้")
-    st.markdown("**รัศมีขอบดายแนะนำ** (Kaczmarek)")
-    st.latex(rf"r_d=0.8\sqrt{{(D_0-d_p)\,t}}=0.8\sqrt{{({D0:.1f}-{dp:.1f})({t:.2f})}}={rd_rec:.2f}\ \text{{mm}}")
-    st.caption(f"ค่าที่กรอก rd = {rd:.1f} มม. ({rd / t:.1f}t) · ช่วงที่ใช้ทั่วไป 5–10t = {5 * t:.1f}–{10 * t:.1f} มม. · "
-               f"รัศมีพันช์ทั่วไป 4–8t = {4 * t:.1f}–{8 * t:.1f} มม. (กรอกไว้ {rp:.1f} มม.)")
+    rd_oe = core.die_radius_recommend(D0, dp, t)
+    st.markdown("**ระยะช่องว่างแม่พิมพ์** สมการ (5.9)")
+    st.latex(rf"CL=T+{kc}\sqrt{{10T}}={t:.2f}+{kc}\sqrt{{10({t:.2f})}}={clr:.3f}\ \text{{mm}}")
+    st.latex(rf"D_{{die}}=d_p+2\,CL={dp:.2f}+2({clr:.3f})={dp + 2 * clr:.2f}\ \text{{mm}}")
+    st.caption("สมการ (5.9) สำหรับแผ่นเหล็ก (k = 0.07) · ถ้าใช้ช่องว่างน้อยกว่าความหนา ผนังถ้วยจะถูกรีด (ironing) ต้องใช้แรงเพิ่ม")
+    st.markdown("**รัศมีดาย** สมการ (5.10) Oehler & Kaiser และ (5.11) Sellin")
+    st.latex(rf"R_D=0.035\,[50+(d_0-d_1)]\sqrt{{T}}=0.035\,[50+({D0:.1f}-{dp:.1f})]\sqrt{{{t:.2f}}}={rd_oe:.2f}\ \text{{mm}}")
+    st.latex(rf"R_D=(5\text{{–}}10)\,T={5 * t:.1f}\text{{–}}{10 * t:.1f}\ \text{{mm}}")
+    st.markdown("**รัศมีพั้นช์** สมการ (5.12)")
+    st.latex(rf"r_p=(3\text{{–}}5)\,r_d=(3\text{{–}}5)({rd:.1f})={3 * rd:.1f}\text{{–}}{5 * rd:.1f}\ \text{{mm}}")
+    st.caption(f"ค่าที่กรอก: r_d = {rd:.1f} มม. ({rd / t:.1f}T) · r_p = {rp:.1f} มม. ({rp / rd:.1f} เท่าของ r_d)")
 
     # 3. แรงกดยึด
-    st.subheader("3. แรงกดยึดชิ้นงาน (Blank holder force)")
-    st.markdown("**แรงกดจำเพาะ** (Siebel)")
-    st.latex(r"p=c\cdot10^{-3}\left[(\beta-1)^2+\frac{D_0}{200\,t}\right]R_m")
-    st.latex(rf"p={mat['c']}\cdot10^{{-3}}\left[({beta:.3f}-1)^2+\frac{{{D0:.1f}}}{{200({t:.2f})}}\right]({Rm:.0f})"
-             rf"={p_bh:.3f}\ \text{{MPa}}")
-    st.markdown("**พื้นที่ใต้แผ่นกดยึด**")
-    st.latex(rf"A=\frac{{\pi}}{{4}}\left[D_0^2-(d_p+2r_d+2t)^2\right]"
-             rf"=\frac{{\pi}}{{4}}\left[{D0:.1f}^2-{di:.1f}^2\right]={area:.0f}\ \text{{mm}}^2")
-    st.markdown("**แรงกดยึดตามสูตร**")
-    st.latex(rf"F_{{BH}}=p\cdot A={p_bh:.3f}\times{area:.0f}={f_siebel * 1000:.0f}\ \text{{N}}={f_siebel:.2f}\ \text{{kN}}")
+    st.subheader("3. แรงกดบนแผ่นจับชิ้นงาน")
+    st.markdown("**แรงดันในการกดแผ่นจับชิ้นงาน** สมการ (5.5)")
+    st.latex(r"P_{BH}=10^{-3}\,C\left[(\beta-1)^3+\frac{0.005\,d_0}{T}\right]\sigma_u")
+    st.latex(rf"P_{{BH}}=10^{{-3}}({C_const:.1f})\left[({beta:.2f}-1)^3+\frac{{0.005({D0:.1f})}}{{{t:.2f}}}\right]({Rm:.0f})"
+             rf"={p_bh:.3f}\ \text{{N/mm}}^2")
+    st.markdown("**พื้นที่ปีกที่แผ่นจับชิ้นงานกด และแรงกด** สมการ (5.6)")
+    st.latex(rf"A_{{BH}}=\frac{{\pi}}{{4}}(d_0^2-d_1^2)=\frac{{\pi}}{{4}}({D0:.1f}^2-{dp:.1f}^2)={area:.2f}\ \text{{mm}}^2")
+    st.latex(rf"F_{{BH}}=P_{{BH}}\times A_{{BH}}={p_bh:.3f}\times{area:.2f}={f_siebel * 1000:.0f}\ \text{{N}}={f_siebel:.2f}\ \text{{kN}}")
     st.markdown("**ค่าจากโมเดล ML** = ค่าสูตรพื้นฐาน × ตัวแก้ที่โมเดลเรียนรู้")
     st.latex(rf"F_{{BH,ML}}=F_{{BH,base}}\times e^{{\hat y}}={float(base_bh[0]):.2f}\times{corr:.3f}"
              rf"={fbh_ml:.2f}\ \text{{kN}}")
-    st.caption("F_BH,base ใช้ c = 2.5 และ βmax = 2.0 สำหรับทุกวัสดุ ความต่างของวัสดุ ค่า r และข้อมูลจริง ถูกรวมอยู่ในตัวแก้ของโมเดล")
+    st.caption("F_BH,base ใช้สมการ (5.5)–(5.6) ที่ C = 3.0 · ผลของวัสดุ ค่า r แรงเสียดทาน และข้อมูลจริง อยู่ในตัวแก้ของโมเดล")
 
-    # 4. แรงลาก
-    st.subheader("4. แรงลากขึ้นรูป")
-    fd_formula = float(ph["F_draw_kN"])
-    st.latex(r"F_d=\pi\,(d_p+t)\,t\,R_m\,n+2\mu F_{BH},\qquad n=\frac{1.2(\beta-1)}{\beta_{max}-1}\ (0.3\text{–}1.25)")
-    st.latex(rf"n=\frac{{1.2({beta:.3f}-1)}}{{{mat['bmax']}-1}}={n_fac:.3f}")
-    st.latex(rf"F_d=\pi({dp + t:.1f})({t:.2f})({Rm:.0f})({n_fac:.3f})+2({mu:.2f})({f_siebel * 1000:.0f})"
-             rf"={fd_formula * 1000:.0f}\ \text{{N}}={fd_formula:.1f}\ \text{{kN}}")
-    st.caption(f"ค่าจากโมเดล ML = {fd:.1f} kN · แรงลากต้องน้อยกว่าแรงที่ผนังถ้วยรับได้ "
-               f"π·dm·t·Rm = {math.pi * (dp + t) * t * Rm / 1000:.1f} kN มิฉะนั้นก้นถ้วยจะขาด")
+    # 4. แรงลาก / แรงแตก
+    st.subheader("4. แรงลากขึ้นรูปและแรงที่ทำให้แตก")
+    dm = dp + t
+    st.markdown("**แรงสูงสุดในการลากขึ้นรูป** สมการ (5.14)")
+    st.latex(r"F_{max}=\pi\,d_m\,T\left[1.1\,\frac{1.3\,\sigma_u}{\eta_{def}}\left(\ln\frac{d_0}{d_1}-0.25\right)\right],\quad d_m=d_1+T")
+    st.latex(rf"F_{{max}}=\pi({dm:.2f})({t:.2f})\left[1.1\,\frac{{1.3({Rm:.0f})}}{{{eta:.2f}}}"
+             rf"\left(\ln\frac{{{D0:.1f}}}{{{dp:.1f}}}-0.25\right)\right]={fmax_f * 1000:.0f}\ \text{{N}}={fmax_f:.2f}\ \text{{kN}}")
+    st.caption(f"ค่าจากโมเดล ML = {fd:.1f} kN · η_def น้อย → แรงมาก (ปลอดภัยกว่า) · ช่วง η 0.5–0.7 ให้ "
+               f"{float(core.fmax_draw(dp, t, D0, Rm, 0.7)) / 1000:.1f}–{float(core.fmax_draw(dp, t, D0, Rm, 0.5)) / 1000:.1f} kN")
+    st.markdown("**แรงที่ทำให้เกิดการแตก** สมการ (5.7)")
+    st.latex(r"F_{cr}=\pi\,d_m\,T\,\sigma_u\,a_{cr}")
+    st.latex(rf"F_{{cr}}=\pi({dm:.2f})({t:.2f})({Rm:.0f})({acr_lo}\text{{–}}{acr_hi})={fcr_lo:.2f}\text{{–}}{fcr_hi:.2f}\ \text{{kN}}")
+    st.dataframe(pd.DataFrame({"วัสดุ": ["แผ่นเหล็กทั่วไป (SAE 1006)", "เหล็กกล้าไร้สนิม (AISI 304)",
+                                         "ทองเหลือง (UNS C27000)", "อะลูมิเนียม (AA 1050-0)"],
+                               "a_cr": ["1.05–1.55", "0.95–1.30", "0.92–1.27", "0.99–1.22"]}),
+                 hide_index=True)
+    if fmax_f < fcr_lo:
+        st.success(f"Fmax = {fmax_f:.2f} kN < Fcr ต่ำสุด = {fcr_lo:.2f} kN → ลากขึ้นรูปได้โดยไม่แตก (แม้ใช้ a_cr ต่ำสุด)")
+    elif fmax_f < fcr_hi:
+        st.warning(f"Fmax = {fmax_f:.2f} kN อยู่ระหว่าง Fcr {fcr_lo:.2f}–{fcr_hi:.2f} kN → ผ่านเฉพาะเมื่อใช้ a_cr สูง "
+                   "ควรเผื่อความปลอดภัยโดยเทียบกับ a_cr ต่ำสุด")
+    else:
+        st.error(f"Fmax = {fmax_f:.2f} kN > Fcr สูงสุด = {fcr_hi:.2f} kN → ชิ้นงานจะแตก")
 
     # 5. สปริง
     st.subheader("5. สปริงแม่พิมพ์")
@@ -494,11 +531,24 @@ with tab_calc:
              rf"\qquad \frac{{s_{{max}}}}{{L_0}}\times100={des['defl_pct']:.1f}\%")
     st.caption("ถ้าใช้สปริงจากแคตตาล็อก ให้คำนวณซ้ำด้วยค่า k จริงของรุ่นที่เลือก: F0 = N·k·s0 ต้องไม่น้อยกว่าแรงกดยึดที่ต้องการ")
 
-    # 6. เครื่องเพรส
-    st.subheader("6. ขนาดเครื่องเพรส")
-    st.latex(rf"P=\frac{{(F_d+F_{{end}})\times1.3}}{{9.807}}=\frac{{({fd:.1f}+{des['F_end_total'] / 1000:.1f})\times1.3}}{{9.807}}"
+    # 6. ดายคูชั่น
+    st.subheader("6. ถ้าใช้ดายคูชั่นแทนสปริง")
+    st.caption("ดายคูชั่นให้แรงกดเกือบคงที่ตลอดจังหวะ (P_BH คงที่) · แรงแปรผันตรงกับแรงดันลม")
+    cc1, cc2 = st.columns(2)
+    cap = cc1.number_input("ความจุดายคูชั่น (kN)", min_value=1.0, value=63.0, step=1.0)
+    prt = cc2.number_input("ที่แรงดันลม (MPa)", min_value=0.05, value=0.5, step=0.05)
+    p_air_f = core.cushion_air_pressure(f_siebel, cap, prt)
+    p_air_ml = core.cushion_air_pressure(fbh_ml, cap, prt)
+    st.latex(rf"P_{{air}}=\frac{{F_{{BH}}}}{{F_{{rated}}}}\times P_{{rated}}=\frac{{{f_siebel:.2f}}}{{{cap:.0f}}}\times{prt:.2f}"
+             rf"={p_air_f:.3f}\ \text{{MPa}}\ (\approx{p_air_f * 10:.2f}\ \text{{bar}})")
+    st.caption(f"จากค่า ML ({fbh_ml:.2f} kN) ต้องตั้งลม ≈ {p_air_ml:.3f} MPa · ค่าเริ่มต้นตามตารางที่ 5.3 (NNCY-8-1: 63 kN ที่ 0.5 MPa) "
+               "· ถ้ากราฟของเครื่องจริงไม่ผ่านจุดศูนย์ ให้อ่านจากกราฟของเครื่องแทน")
+
+    # 7. เครื่องเพรส
+    st.subheader("7. แรงในการเลือกเครื่องจักร")
+    st.latex(rf"P=\frac{{1.5\,(F_d+F_{{end}})}}{{9.807}}=\frac{{1.5\,({fd:.1f}+{des['F_end_total'] / 1000:.1f})}}{{9.807}}"
              rf"={press_ton:.1f}\ \text{{ton}}")
-    st.caption("ตัวคูณ 1.3 เผื่อความแปรปรวนของวัสดุและแรงกระแทก · ตรวจเพิ่มว่าแรงสูงสุดเกิดในช่วงระยะพิกัดแรงของเครื่อง (rated stroke) หรือไม่")
+    st.caption("ตัวคูณ 1.5 เท่าของแรงลากขึ้นรูป · รวมแรงกดยึดท้ายจังหวะด้วย เพราะสปริง/คูชั่นดันสวนแรมตลอดจังหวะ")
 
 # ---------------- แท็บ 2: โมเดล ----------------
 with tab_model:
