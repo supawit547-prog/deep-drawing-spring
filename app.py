@@ -20,7 +20,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import streamlit as st
-from matplotlib.patches import Rectangle
 
 import dd_core as core
 
@@ -162,63 +161,6 @@ tab_pred, tab_calc, tab_model, tab_data = st.tabs(
     ["ทำนายและออกแบบสปริง", "สูตรการคำนวณ", "โมเดล ML", "ข้อมูลจริงจากโรงงาน"])
 
 
-def draw_section(x: dict, s0: float, L0: float, smax: float, k: float, N: int, pos: float, color: str):
-    """ภาพตัดแม่พิมพ์แบบง่าย (หน่วย มม.)"""
-    t, D0, dp, rd, h = x["t"], x["D0"], x["dp"], x["rd"], x["h"]
-    d = pos * (smax - s0)
-    dd = min(d, h)
-    Rh = max(D0 / 2, dp / 2 + rd + t) + 8
-    rc, rp = dp / 2 + 1.1 * t, dp / 2
-    steel, die_c, ink = "#B7C0C8", "#8894A0", "#18212A"
-
-    fig, ax = plt.subplots(figsize=(5.2, 4.6))
-    depth = h + 12
-    ax.add_patch(Rectangle((-Rh, -depth), Rh - rc, depth, fc=die_c, ec=ink))
-    ax.add_patch(Rectangle((rc, -depth), Rh - rc, depth, fc=die_c, ec=ink))
-
-    # แผ่นงาน / ถ้วย (ปริมาตรคงที่)
-    yB, rpm, R0 = t / 2, dp / 2 + t / 2, D0 / 2
-    Rf2 = R0 ** 2 - 2 * rpm * dd
-    if Rf2 > rpm ** 2:
-        Rf = math.sqrt(Rf2)
-        xs, ys = [-Rf, -rpm, -rpm, rpm, rpm, Rf], [yB, yB, yB - dd, yB - dd, yB, yB]
-    else:
-        wall = (R0 ** 2 - rpm ** 2) / (2 * rpm)
-        yb = yB - dd
-        xs, ys = [-rpm, -rpm, rpm, rpm], [yb + wall, yb, yb, yb + wall]
-    ax.plot(xs, ys, color="#0D5A6D", lw=3, solid_joinstyle="round", zorder=3)
-
-    # แผ่นกดยึด
-    hin, hold_h = dp / 2 + 1.5 * t, 10
-    hold_top = t + hold_h
-    ax.add_patch(Rectangle((-Rh, t), Rh - hin, hold_h, fc=steel, ec=ink, zorder=4))
-    ax.add_patch(Rectangle((hin, t), Rh - hin, hold_h, fc=steel, ec=ink, zorder=4))
-
-    # สปริง
-    Lc = L0 - (s0 + d)
-    plate_bot = hold_top + Lc
-    sw = min(0.35 * (Rh - hin), 12)
-    for sx in (-(hin + Rh) / 2, (hin + Rh) / 2):
-        n = 16
-        ys_ = np.linspace(hold_top, plate_bot, n + 1)
-        xs_ = [sx] + [sx + (sw / 2 if i % 2 else -sw / 2) for i in range(1, n)] + [sx]
-        ax.plot(xs_, ys_, color=color, lw=2.2, zorder=4)
-
-    # เพลทบนและพันช์
-    ax.add_patch(Rectangle((-Rh, plate_bot), 2 * Rh, 10, fc=steel, ec=ink, zorder=5))
-    punch_bot = t - d
-    ax.add_patch(Rectangle((-rp, punch_bot), 2 * rp, plate_bot - punch_bot, fc=steel, ec=ink, zorder=5))
-
-    F = N * k * (s0 + d) / 1000
-    ax.set_title(f"Holder force {F:.1f} kN  |  spring {s0 + d:.1f}/{L0:.0f} mm  |  depth {dd:.1f} mm", fontsize=9)
-    ax.set_xlim(-Rh - 5, Rh + 5)
-    ax.set_ylim(-depth - 3, plate_bot + 14)
-    ax.set_aspect("equal")
-    ax.axis("off")
-    fig.tight_layout()
-    return fig, F, d
-
-
 # ---------------- แท็บ 1: ทำนาย ----------------
 with tab_pred:
     ph = core.physics(x, mat["c"], mat["bmax"])
@@ -243,7 +185,7 @@ with tab_pred:
     for level, msg in core.check_warnings(x, mat, des, bundle.get("ranges")):
         (st.error if level == "error" else st.warning)(msg)
 
-    left, right = st.columns([1.1, 1])
+    left, right = st.columns([1, 1.2])
     with left:
         st.subheader("รายละเอียดสปริง")
         st.table(pd.DataFrame({
@@ -254,6 +196,7 @@ with tab_pred:
                     f"{des['defl_pct']:.1f}%"],
         }).set_index("รายการ"))
 
+    with right:
         st.subheader("เลือกคลาสสปริง")
         status_th = {"ok": "✅ ผ่าน", "mid": "⚠️ อายุสั้นลง", "bad": "❌ ยุบเกิน"}
         cls = pd.DataFrame([{
@@ -263,15 +206,6 @@ with tab_pred:
         } for c in des["classes"]])
         st.dataframe(cls, hide_index=True, use_container_width=True)
         st.caption("ขีดจำกัดระยะยุบเป็นค่าประมาณ ตรวจสอบกับแคตตาล็อกผู้ผลิต แล้วเลือกขนาดที่ค่าคงที่สปริง ≥ ค่าที่ต้องการ")
-
-    with right:
-        st.subheader("ภาพตัดแม่พิมพ์")
-        pos = st.slider("ตำแหน่งจังหวะกด (%)", 0, 100, 45) / 100
-        best = next((c for c in core.CLASSES if c["id"] == des["best"]), core.CLASSES[2])
-        fig, F_now, d_now = draw_section(x, s0, L0, des["smax"], des["k"], N, pos, core.COLOR_HEX[best[std]])
-        st.pyplot(fig)
-        plt.close(fig)
-        st.caption(f"แรงกดยึดรวม {F_now:.1f} kN ที่ระยะพันช์ลงไป {d_now:.1f} มม. (สปริงสี{core.COLOR_TH[best[std]]})")
 
     st.divider()
     st.subheader("บันทึกผลลองแม่พิมพ์จริง")
