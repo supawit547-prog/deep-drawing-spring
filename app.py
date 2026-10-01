@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import os
 from pathlib import Path
@@ -102,53 +103,138 @@ bundle = st.session_state["bundle"]
 # แถบซ้าย: อินพุต
 # ---------------------------------------------------------------------------
 sb = st.sidebar
+
+# ---------------------------------------------------------------------------
+# บันทึก / เปิดงาน — ค่าในแถบซ้ายเก็บใน session_state ตาม key ของแต่ละช่อง
+# ---------------------------------------------------------------------------
+DEFAULTS = {"mat": "SPCC", "mu": 0.10, "t": 1.0, "dp": 60.0, "h": 25.0, "rd": 6.0, "rp": 5.0,
+            "auto_d0": False, "D0": 110.0, "N": 4, "s0": 15.0, "margin": 3.0, "L0": 150.0, "sf": 1.15, "std": "iso"}
+NUM_KEYS = ["mu", "t", "dp", "h", "rd", "rp", "D0", "s0", "margin", "L0", "sf"]
+LIMITS = {"mu": (0.01, 0.5), "t": (0.1, None), "dp": (1.0, None), "h": (0.5, None), "rd": (0.1, None),
+          "rp": (0.0, None), "D0": (1.0, None), "s0": (0.5, None), "margin": (0.0, None), "L0": (5.0, None),
+          "sf": (1.0, None), "Rm": (1.0, None), "Re": (1.0, None), "r": (0.1, None)}
+
+
+def _clamp(k: str, v) -> float:
+    lo, hi = LIMITS.get(k, (None, None))
+    v = float(v)
+    if lo is not None:
+        v = max(v, lo)
+    if hi is not None:
+        v = min(v, hi)
+    return v
+for _k, _v in DEFAULTS.items():
+    st.session_state.setdefault(_k, _v)
+st.session_state.setdefault("uploader_n", 0)
+
+
+def apply_job(data: dict) -> str:
+    """นำค่าจากไฟล์งานเข้าแถบซ้าย คืนชื่องาน"""
+    inp = data.get("inputs", data)
+    mat_in = str(inp.get("mat", "")).strip()
+    if mat_in not in core.MATERIALS:
+        raise ValueError(f"ไม่รู้จักวัสดุ '{mat_in}'")
+    st.session_state["mat"] = mat_in
+    for k in ("Rm", "Re", "r"):
+        if k in inp:
+            st.session_state[f"{k}_{mat_in}"] = _clamp(k, inp[k])
+    for k in NUM_KEYS:
+        if k in inp:
+            st.session_state[k] = _clamp(k, inp[k])
+    if "N" in inp:
+        st.session_state["N"] = max(1, int(inp["N"]))
+    if inp.get("std") in ("iso", "jis"):
+        st.session_state["std"] = inp["std"]
+    st.session_state["auto_d0"] = bool(inp.get("auto_d0", False))
+    st.session_state["job_name"] = str(data.get("name", ""))
+    return str(data.get("name", "")) or "ไม่มีชื่อ"
+
+
+with sb.expander("📂 เปิดงานที่บันทึกไว้", expanded=False):
+    up_job = st.file_uploader("เลือกไฟล์งาน (.json)", type=["json"], key=f"job_file_{st.session_state['uploader_n']}")
+    if up_job is not None:
+        try:
+            name_loaded = apply_job(json.loads(up_job.getvalue().decode("utf-8-sig")))
+            st.session_state["job_msg"] = f"เปิดงาน '{name_loaded}' แล้ว"
+        except Exception as e:
+            st.session_state["job_msg"] = f"เปิดไฟล์ไม่สำเร็จ: {e}"
+        st.session_state["uploader_n"] += 1      # ล้างช่องอัปโหลด กันโหลดซ้ำ
+        st.rerun()
+if "job_msg" in st.session_state:
+    msg = st.session_state.pop("job_msg")
+    (sb.error if msg.startswith("เปิดไฟล์ไม่สำเร็จ") else sb.success)(msg)
+
 sb.header("วัสดุแผ่น")
-mat_key = sb.selectbox("ชนิดวัสดุ", list(core.MATERIALS), format_func=lambda k: core.MATERIALS[k]["name"])
+mat_key = sb.selectbox("ชนิดวัสดุ", list(core.MATERIALS), format_func=lambda k: core.MATERIALS[k]["name"], key="mat")
 mat = core.MATERIALS[mat_key]
+for _k in ("Rm", "Re", "r"):
+    st.session_state.setdefault(f"{_k}_{mat_key}", float(mat[_k]))
 c1, c2 = sb.columns(2)
-Rm = c1.number_input("Rm (MPa)", min_value=1.0, value=float(mat["Rm"]), step=5.0, key=f"Rm_{mat_key}",
+Rm = c1.number_input("Rm (MPa)", min_value=1.0, step=5.0, key=f"Rm_{mat_key}",
                      help="ความต้านแรงดึงสูงสุด Rm = Fmax / A0 จากใบรับรองวัสดุ (mill certificate) หรือผลทดสอบแรงดึง")
-Re = c2.number_input("Re (MPa)", min_value=1.0, value=float(mat["Re"]), step=5.0, key=f"Re_{mat_key}",
+Re = c2.number_input("Re (MPa)", min_value=1.0, step=5.0, key=f"Re_{mat_key}",
                      help="จุดคราก Re (หรือ Rp0.2) = F_yield / A0 จากใบรับรองวัสดุ ต้องน้อยกว่า Rm")
-r_val = c1.number_input("ค่า r (Lankford)", min_value=0.1, value=float(mat["r"]), step=0.05, key=f"r_{mat_key}",
+r_val = c1.number_input("ค่า r (Lankford)", min_value=0.1, step=0.05, key=f"r_{mat_key}",
                         help="r = ln(w0/w) / ln(t0/t) จากการดึงชิ้นทดสอบ · ค่าเฉลี่ย r̄ = (r0 + 2·r45 + r90)/4 · r สูง = ลากลึกได้ดี")
-mu = c2.number_input("แรงเสียดทาน μ", min_value=0.01, max_value=0.5, value=0.10, step=0.01,
+mu = c2.number_input("แรงเสียดทาน μ", min_value=0.01, max_value=0.5, step=0.01, key="mu",
                      help="น้ำมันลากขึ้นรูปอย่างดี/ฟิล์ม 0.03–0.06 · น้ำมันทั่วไป 0.08–0.12 · แห้ง/ไม่หล่อลื่น 0.15–0.20")
 
 sb.header("ขนาดชิ้นงาน (มม.)")
 c1, c2 = sb.columns(2)
-t = c1.number_input("ความหนา t", min_value=0.1, value=1.0, step=0.1, help="ความหนาแผ่นตามแบบ (nominal)")
-dp = c2.number_input("พันช์ dp", min_value=1.0, value=60.0, step=1.0,
+t = c1.number_input("ความหนา t", min_value=0.1, step=0.1, key="t", help="ความหนาแผ่นตามแบบ (nominal)")
+dp = c2.number_input("พันช์ dp", min_value=1.0, step=1.0, key="dp",
                      help="= เส้นผ่านศูนย์กลางใน ของชิ้นงาน · ถ้าแบบให้ขนาดนอก: dp = d_นอก − 2t")
-h = c1.number_input("ความลึก h", min_value=0.5, value=25.0, step=1.0,
+h = c1.number_input("ความลึก h", min_value=0.5, step=1.0, key="h",
                     help="ระยะที่พันช์ลงไปในดาย ≈ ความสูงถ้วย (วัดด้านใน) ไม่รวมขอบตัดแต่ง")
-rd = c2.number_input("รัศมีดาย rd", min_value=0.1, value=6.0, step=0.5,
+rd = c2.number_input("รัศมีดาย rd", min_value=0.1, step=0.5, key="rd",
                      help="รัศมีขอบปากดาย · ทั่วไป 5–10t หรือ rd = 0.8·√((D0 − dp)·t) · เล็กไป = ขาด, ใหญ่ไป = ย่น")
-rp = c1.number_input("รัศมีพันช์ rp", min_value=0.0, value=5.0, step=0.5, help="= รัศมีมุมในก้นถ้วยตามแบบ · ทั่วไป 4–8t · ใช้คำนวณขนาดแผ่นเปล่า")
-auto_d0 = sb.checkbox("คำนวณ D0 จาก dp และ h อัตโนมัติ", value=False)
+rp = c1.number_input("รัศมีพันช์ rp", min_value=0.0, step=0.5, key="rp",
+                     help="= รัศมีมุมในก้นถ้วยตามแบบ · ทั่วไป 4–8t · ใช้คำนวณขนาดแผ่นเปล่า")
+auto_d0 = sb.checkbox("คำนวณ D0 จาก dp และ h อัตโนมัติ", key="auto_d0")
 if auto_d0:
     D0 = round(core.blank_diameter(dp, h, rp, t), 1)
     sb.markdown(f"**D0 = {D0:.1f} มม.**")
 else:
-    D0 = sb.number_input("แผ่นเปล่า D0", min_value=1.0, value=110.0, step=1.0,
+    D0 = sb.number_input("แผ่นเปล่า D0", min_value=1.0, step=1.0, key="D0",
                          help="D0 = √(d² + 4dh − 1.72·d·rp − 0.56·rp²), d = dp + t · บวกเผื่อขอบตัดแต่ง 2–5%")
 
 sb.header("การจัดวางสปริง")
 c1, c2 = sb.columns(2)
-N = int(c1.number_input("จำนวนสปริง", min_value=1, value=4, step=1,
+N = int(c1.number_input("จำนวนสปริง", min_value=1, step=1, key="N",
                         help="ใช้จำนวนคู่ วางสมมาตรรอบแผ่นกดยึด (4, 6, 8…) · N ≥ F0 / แรงที่สปริง 1 ตัวให้ได้"))
-s0 = c2.number_input("ระยะอัดล่วงหน้า (มม.)", min_value=0.5, value=15.0, step=0.5,
+s0 = c2.number_input("ระยะอัดล่วงหน้า (มม.)", min_value=0.5, step=0.5, key="s0",
                      help="ระยะที่สปริงถูกอัดไว้ตอนประกอบแม่พิมพ์ · ค่าน้อยสุด s0 = (h + ระยะเผื่อ)/(R − 1) โดย R = อัตราแรงท้าย/เริ่มที่ยอมรับ (≈ 2–3)")
-margin = c1.number_input("ระยะเผื่อจังหวะ (มม.)", min_value=0.0, value=3.0, step=0.5,
+margin = c1.number_input("ระยะเผื่อจังหวะ (มม.)", min_value=0.0, step=0.5, key="margin",
                          help="ระยะยุบเพิ่มเกิน h เผื่อการตั้งเครื่อง/สึกหรอ · ทั่วไป 2–5 มม.")
-L0 = c2.number_input("ความยาวอิสระ L0 (มม.)", min_value=5.0, value=150.0, step=5.0,
+L0 = c2.number_input("ความยาวอิสระ L0 (มม.)", min_value=5.0, step=5.0, key="L0",
                      help="ความยาวสปริงตอนไม่ถูกอัด · L0 ≥ s_max / ขีดจำกัดระยะยุบ ของคลาสที่เลือก")
-sf = c1.number_input("ตัวคูณเผื่อแรง", min_value=1.0, value=1.15, step=0.05,
+sf = c1.number_input("ตัวคูณเผื่อแรง", min_value=1.0, step=0.05, key="sf",
                      help="เผื่อความแปรปรวนวัสดุ/สปริงล้า · ทั่วไป 1.1–1.3")
 std = c2.selectbox("มาตรฐานสี", ["iso", "jis"], format_func=lambda s: "ISO 10243" if s == "iso" else "JIS / MISUMI",
+                   key="std",
                    help="ISO: เขียว=เบา น้ำเงิน=กลาง แดง=หนัก เหลือง=หนักพิเศษ · JIS: เหลือง=เบา น้ำเงิน=กลาง แดง=หนัก เขียว=หนักพิเศษ")
 
 x = {"t": t, "D0": D0, "dp": dp, "rd": rd, "h": h, "Rm": Rm, "Re": Re, "r": r_val, "mu": mu}
+
+# ---- บันทึกงาน ----
+sb.header("💾 บันทึกงาน")
+job_name = sb.text_input("ชื่องาน", key="job_name", placeholder="เช่น ถ้วย Ø60 ลึก 25 SPCC")
+_fbh_s, _fd_s = core.predict(bundle, x)
+_des_s = core.spring_design(_fbh_s, N, s0, h, margin, L0, sf)
+job_data = {
+    "app": "deep-drawing-spring", "version": 1, "name": job_name,
+    "saved_at": dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+    "inputs": {"mat": mat_key, "Rm": Rm, "Re": Re, "r": r_val, "mu": mu, "t": t, "dp": dp, "h": h, "rd": rd,
+               "rp": rp, "auto_d0": auto_d0, "D0": D0, "N": N, "s0": s0, "margin": margin, "L0": L0, "sf": sf,
+               "std": std},
+    "results": {"F_BH_kN": round(_fbh_s, 3), "spring_k_N_per_mm": round(_des_s["k"], 1),
+                "F_draw_kN": round(_fd_s, 2) if _fd_s else None, "spring_class": _des_s["best"],
+                "note": "ผลลัพธ์ ณ เวลาบันทึก ใช้อ้างอิงเท่านั้น เปิดงานแล้วโปรแกรมจะคำนวณใหม่"},
+}
+_safe = "".join(ch for ch in (job_name or "งาน") if ch not in '\\/:*?"<>|').strip() or "งาน"
+sb.download_button("💾 บันทึกงานเป็นไฟล์", json.dumps(job_data, ensure_ascii=False, indent=2).encode("utf-8"),
+                   file_name=f"{_safe}.json", mime="application/json", use_container_width=True)
+sb.caption("ไฟล์จะอยู่ในโฟลเดอร์ Downloads · ครั้งหน้ากด '📂 เปิดงานที่บันทึกไว้' ด้านบนสุด")
 
 # ---------------------------------------------------------------------------
 # หน้าหลัก
